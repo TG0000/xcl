@@ -403,8 +403,10 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
-        // a CLWB another thread patched after this one faulted on it: run the patch
-        if clwb_patched(rip) {
+        // a CLWB another thread patched after this one faulted on it: run the patch.
+        // Check that our short-jump opcode is still there so an unloaded-and-reused address
+        // with a genuine #UD does not spin forever.
+        if code.first() == Some(&0xEB) && clwb_patched(rip) {
             return -1;
         }
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
@@ -1326,6 +1328,18 @@ mod tests {
             assert_eq!(fault_at(rip), (-1, rip), "a late fault on the patched CLWB");
             call(rip);
         }
+        // if the address is later reused by different code (e.g. after a DLL unload) and hits a
+        // genuine #UD, a stale CLWB_PATCHES entry must not resume into an infinite fault loop
+        let reused = code + sites[0].0;
+        unsafe {
+            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(reused as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old), 0);
+            std::slice::from_raw_parts_mut(reused as *mut u8, 4).copy_from_slice(&[0xFE, 0xFF, 0xCC, 0xCC]);
+            let mut was = 0u32;
+            VirtualProtect(reused as *const _, 4, old, &mut was);
+        }
+        assert_eq!(fault_at(reused), (0, reused), "non-jump bytes at a stale patched rip must not spin");
         drop_clwb_code(code);
     }
 
@@ -1356,7 +1370,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
         const CLWB: [u8; 4] = [0x66, 0x0F, 0xAE, 0x30];
         const THREADS: usize = 8;
-        // even offsets (for the watcher's 16-bit loads), one in four crossing a qword (k % 4 == 3)
+        // even offsets (for the watcher's 16-bit loads) across all four slots of each qword
         let sites: Vec<usize> = (0..64).map(|k| k * 0x20 + 2 * (k % 4)).collect();
         let code = clwb_code("clwb_threads.exe", |c| {
             c.fill(0xCC);
