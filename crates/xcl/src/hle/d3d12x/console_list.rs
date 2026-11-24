@@ -495,15 +495,24 @@ unsafe extern "system" fn cl_set_root_constants(this: *mut c_void, i: u32, n: u3
 unsafe extern "system" fn cl_set_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     push(this as usize, &[header(i as usize), va as u32, (va >> 32) as u32]);
 }
+/// `count` items at `ptr`, or none when `count` is zero: a caller with nothing to pass may pass
+/// a null pointer, which `from_raw_parts` does not accept even for an empty slice.
+unsafe fn counted<'a, T>(ptr: *const T, count: usize) -> &'a [T] {
+    if count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, count)
+    }
+}
 /// #32 SetDescriptorHeaps(n, heaps)
 unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
     // each heap pointer as its low and high words: the pointer's own bytes (little-endian)
-    let named = std::slice::from_raw_parts(heaps as *const u32, 2 * n as usize);
+    let named = counted(heaps as *const u32, 2 * n as usize);
     push_parts(this as usize, &[&[HEAPS_MARKER, n], named]);
 }
 /// #26 ResourceBarrier(n, barriers): D3D12_RESOURCE_BARRIER, 32 bytes each
 unsafe extern "system" fn cl_resource_barrier(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
-    let words = std::slice::from_raw_parts(barriers as *const u32, 8 * n as usize);
+    let words = counted(barriers as *const u32, 8 * n as usize);
     push_parts(this as usize, &[&[TRANSITIONS_MARKER, n], words]);
 }
 /// #15 CopyBufferRegion(dst, dst offset, src, src offset, bytes)
@@ -1081,6 +1090,21 @@ mod tests {
             }
             want.extend([DISPATCH, 4, 5, 6, BARRIER_MARKER]);
             assert_eq!(recorded_words(this), want);
+            drop_bare(obj);
+        }
+    }
+
+    /// No heaps and no barriers is a legal call with a null array: each still records its header
+    /// (the replay reads the count), and nothing reads the pointer.
+    #[test]
+    fn a_call_with_no_entries_records_its_header_for_a_null_array() {
+        unsafe {
+            let obj = bare_list();
+            let this = obj as *mut c_void;
+            cl_set_descriptor_heaps(this, 0, std::ptr::null());
+            cl_resource_barrier(this, 0, std::ptr::null());
+            cl_set_root_constants(this, 2, 0, std::ptr::null(), 0);
+            assert_eq!(recorded_words(this), vec![HEAPS_MARKER, 0, TRANSITIONS_MARKER, 0]);
             drop_bare(obj);
         }
     }
